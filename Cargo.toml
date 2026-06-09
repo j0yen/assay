@@ -1,0 +1,20 @@
+[workspace]
+members = ["assay-core", "."]
+resolver = "2"
+
+[package]
+name = "assay"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Probe and attest kernel agent-namespace support"
+
+[[bin]]
+name = "assay"
+path = "src/main.rs"
+
+[dependencies]
+assay-core = { path = "assay-core" }
+serde_json = "1"
+sigpipe = "0.1"
