@@ -9,95 +9,44 @@ use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
-// Compiled-in constant mirrored from agentns/include/uapi/linux/agent_namespaces.h
+// prctl constants from agentns/include/uapi/linux/agent_namespaces.h
 //
-// The header comment says it "claims 0x00000100 (an unused lower-pool bit)".
-// However, 0x100 == CLONE_VM — a collision — which is the root-cause this tool
-// documents.  The test binary (agentns/tests/test_unshare.c) uses the fall-back
-// definition 0x400000000ULL (a 64-bit value) and calls SYS_unshare directly with
-// that full value so the upper bits reach the kernel.  On this kernel that 64-bit
-// flag is unrecognised, producing EINVAL (errno 22).
+// PR_AGENT_BASE = 0x41544E53 ("ATNS" magic).  All agent prctl operations
+// are dispatched off this base.  The patch wires PR_SET_AGENT_NS (base+7)
+// into kernel/sys.c and routes it through agentns_create_ns().
 //
-// We mirror both:
-//   CLONE_NEWAGENT_UAPI  — what the kernel header claims (0x100, collides CLONE_VM)
-//   CLONE_NEWAGENT       — what the test binary actually passes (0x400000000, full u64)
-//
-// The attestation uses the full 64-bit value via SYS_unshare to reproduce the
-// live finding documented in PRD phase-1 evidence.
+// Namespace creation goes through prctl(PR_SET_AGENT_NS), NOT through
+// unshare(CLONE_NEWAGENT): the legacy 32-bit clone-flag space is
+// exhausted (CLONE_NEWAGENT_HEADER == 0x100 == CLONE_VM), so there is no
+// free bit to hang a new namespace off.  prctl has a separate dispatch
+// table with ample room.
 // ---------------------------------------------------------------------------
-pub const CLONE_NEWAGENT_HEADER: u32 = 0x0000_0100;   // as-written in uapi header (== CLONE_VM)
-pub const CLONE_NEWAGENT: u64 = 0x0000_0004_0000_0000; // 0x400000000 — 64-bit, used by test_unshare
 
-/// Known-occupied 64-bit clone bits in the 32-bit flags space (lower 32 bits).
-/// Used to check whether the lower 32 bits of CLONE_NEWAGENT collide.
-const KNOWN_CLONE_FLAGS_32: &[(u32, &str)] = &[
-    (0x0000_0100, "CLONE_VM"),
-    (0x0000_0200, "CLONE_FS"),
-    (0x0000_0400, "CLONE_FILES"),
-    (0x0000_0800, "CLONE_SIGHAND"),
-    (0x0000_4000, "CLONE_THREAD"),
-    (0x0004_0000, "CLONE_NEWNS"),
-    (0x0010_0000, "CLONE_SYSVSEM"),
-    (0x0020_0000, "CLONE_SETTLS"),
-    (0x0040_0000, "CLONE_PARENT_SETTID"),
-    (0x0080_0000, "CLONE_CHILD_CLEARTID"),
-    (0x0800_0000, "CLONE_CHILD_SETTID"),
-    (0x0200_0000, "CLONE_NEWCGROUP"),
-    (0x0400_0000, "CLONE_NEWUTS"),
-    (0x0800_0000, "CLONE_NEWIPC"),
-    (0x1000_0000, "CLONE_NEWUSER"),
-    (0x2000_0000, "CLONE_NEWPID"),
-    (0x4000_0000, "CLONE_NEWNET"),
-    (0x0000_0080, "CLONE_NEWTIME"),
-];
+/// prctl base shared by all agent-namespace operations ("ATNS").
+pub const PR_AGENT_BASE: libc::c_int = 0x41544E53u32 as libc::c_int;
 
-/// Check whether `flag` collides with a known-occupied 32-bit clone bit.
-///
-/// The documented collision: the uapi header writes `0x100` (== `CLONE_VM`) as a
-/// comment for the lower-pool allocation.  The 64-bit value used by the test
-/// (`0x400000000`) has no 32-bit collision — it is simply unrecognised by the
-/// kernel.  We record the uapi-header collision separately in the evidence.
-fn check_collision(flag: u64) -> Option<String> {
-    // Check the lower 32 bits for known-occupied bits.
-    let low32 = flag as u32;
-    for &(bit, name) in KNOWN_CLONE_FLAGS_32 {
-        if bit == low32 {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
+/// prctl(PR_SET_AGENT_NS, 0, 0, 0, 0) — create-and-enter a fresh agent NS.
+/// Requires CAP_SYS_ADMIN.
+pub const PR_SET_AGENT_NS: libc::c_int = PR_AGENT_BASE + 7;
 
-/// Check whether the UAPI-header constant (0x100) collides with CLONE_VM.
-fn header_collision() -> Option<String> {
-    check_collision(CLONE_NEWAGENT_HEADER as u64)
-}
+/// prctl(PR_SET_AGENT_INTENT_TAG) — store an intent tag in the current NS.
+const PR_SET_AGENT_INTENT_TAG: libc::c_int = PR_AGENT_BASE + 2;
+
+/// prctl(PR_GET_AGENT_INTENT_TAG) — retrieve the intent tag.
+const PR_GET_AGENT_INTENT_TAG: libc::c_int = PR_AGENT_BASE + 3;
 
 // ---------------------------------------------------------------------------
 // Syscall abstraction
 // ---------------------------------------------------------------------------
-
-/// Result of calling unshare(CLONE_NEWAGENT) inside the child.
-#[derive(Debug)]
-pub struct UnshareResult {
-    /// 0 on success, negative errno on failure.
-    pub errno: i32,
-}
-
-/// Counter snapshot from /proc/self/agent_counters.
-#[derive(Debug, Default, Clone)]
-pub struct AgentCounters {
-    pub syscalls: u64,
-    pub bytes_written: u64,
-}
 
 /// Abstracts the raw kernel syscalls so unit tests can inject fake behaviour.
 pub trait AgentSyscalls {
     /// Read /proc/self/agent_session (32-hex-char string or all-zeros).
     fn read_agent_session(&self) -> std::io::Result<String>;
 
-    /// Call unshare(CLONE_NEWAGENT).  Returns errno (0 = success).
-    fn unshare_newagent(&self) -> i32;
+    /// Call prctl(PR_SET_AGENT_NS) to create and enter a fresh agent NS.
+    /// Returns errno (0 = success, EPERM = needs CAP_SYS_ADMIN).
+    fn create_agent_ns(&self) -> i32;
 
     /// Read /proc/self/agent_counters.
     fn read_agent_counters(&self) -> std::io::Result<AgentCounters>;
@@ -107,6 +56,13 @@ pub trait AgentSyscalls {
 
     /// Perform some counted syscall activity so counters can advance.
     fn do_activity(&self) {}
+}
+
+/// Counter snapshot from /proc/self/agent_counters.
+#[derive(Debug, Default, Clone)]
+pub struct AgentCounters {
+    pub syscalls: u64,
+    pub bytes_written: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +77,8 @@ impl AgentSyscalls for LiveSyscalls {
         Ok(raw.trim().to_string())
     }
 
-    fn unshare_newagent(&self) -> i32 {
-        // Use syscall() directly so the full 64-bit flag reaches the kernel.
-        // glibc's unshare(2) wrapper takes `int`, which truncates upper bits.
-        // This mirrors what agentns/tests/test_unshare.c does.
-        let ret = unsafe { libc::syscall(libc::SYS_unshare, CLONE_NEWAGENT as libc::c_long) };
+    fn create_agent_ns(&self) -> i32 {
+        let ret = unsafe { libc::prctl(PR_SET_AGENT_NS, 0, 0, 0, 0) };
         if ret == 0 {
             0
         } else {
@@ -136,29 +89,20 @@ impl AgentSyscalls for LiveSyscalls {
 
     fn read_agent_counters(&self) -> std::io::Result<AgentCounters> {
         let raw = std::fs::read_to_string("/proc/self/agent_counters")?;
-        let mut counters = AgentCounters::default();
-        for line in raw.lines() {
-            let parts: Vec<&str> = line.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                let key = parts[0].trim();
-                let val: u64 = parts[1].trim().parse().unwrap_or(0);
-                match key {
-                    "syscalls" => counters.syscalls = val,
-                    "bytes_written" => counters.bytes_written = val,
-                    _ => {}
-                }
-            }
-        }
-        Ok(counters)
+        Ok(parse_agent_counters(&raw))
     }
 
     fn intent_tag_roundtrip(&self, tag: u64) -> std::io::Result<u64> {
-        // PR_SET_AGENT_INTENT_TAG / PR_GET_AGENT_INTENT_TAG are hypothetical;
-        // use placeholder prctl numbers matching the agentns patch.
-        const PR_SET_AGENT_INTENT_TAG: libc::c_int = 60;
-        const PR_GET_AGENT_INTENT_TAG: libc::c_int = 61;
+        // The kernel uses copy_from_user/copy_to_user — pass a pointer, not the value.
+        let mut tag_val = tag;
         let set_ret = unsafe {
-            libc::prctl(PR_SET_AGENT_INTENT_TAG, tag as libc::c_ulong, 0, 0, 0)
+            libc::prctl(
+                PR_SET_AGENT_INTENT_TAG,
+                &mut tag_val as *mut u64 as libc::c_ulong,
+                0,
+                0,
+                0,
+            )
         };
         if set_ret != 0 {
             return Err(std::io::Error::last_os_error());
@@ -194,7 +138,7 @@ impl AgentSyscalls for LiveSyscalls {
 /// Serialisable report sent from the child process to the parent.
 #[derive(Debug)]
 struct ChildReport {
-    unshare_errno: i32,
+    prctl_errno: i32,
     after_session: String,
     counters_before: AgentCounters,
     counters_after: AgentCounters,
@@ -205,7 +149,7 @@ fn encode_child_report(r: &ChildReport) -> Vec<u8> {
     // Simple fixed-layout binary: errno(4) + session(33) + cb_sys(8) +
     // cb_bytes(8) + ca_sys(8) + ca_bytes(8) + intent_ok(1)
     let mut buf = Vec::new();
-    buf.extend_from_slice(&r.unshare_errno.to_le_bytes());
+    buf.extend_from_slice(&r.prctl_errno.to_le_bytes());
     let mut sess = [0u8; 33];
     let b = r.after_session.as_bytes();
     let n = b.len().min(32);
@@ -240,7 +184,7 @@ fn decode_child_report(buf: &[u8]) -> Option<ChildReport> {
     off += 8;
     let intent_tag_ok = buf[off] != 0;
     Some(ChildReport {
-        unshare_errno: errno,
+        prctl_errno: errno,
         after_session,
         counters_before: AgentCounters {
             syscalls: cb_sys,
@@ -259,56 +203,31 @@ fn decode_child_report(buf: &[u8]) -> Option<ChildReport> {
 // ---------------------------------------------------------------------------
 
 /// Run the agentns attestation using the provided syscall interface.
-///
-/// This is the main engine called both from the real CLI (where it forks a
-/// child) and from unit tests (where `syscalls` is a fake that returns
-/// scripted values without touching the kernel).
-///
-/// In test/fake mode the fork is skipped and the fake's `unshare_newagent`
-/// is called directly in-process (safe because the fake never mutates kernel
-/// state).
 pub fn attest_with<S: AgentSyscalls>(syscalls: &S) -> AttestReport {
-    let flag = CLONE_NEWAGENT;
-    let collides_with = check_collision(flag);
-    // The uapi-header constant (0x100) collides with CLONE_VM.
-    let header_col = header_collision();
-
     let before_session = syscalls
         .read_agent_session()
         .unwrap_or_else(|_| "error".to_string());
 
     let mut evidence = Evidence::new();
-    // compiled_flag = the uapi-header constant (0x100 == CLONE_VM collision).
-    // This is what AC2 checks.
-    evidence.insert(
-        "compiled_flag".into(),
-        format!("{:#x}", CLONE_NEWAGENT_HEADER),
-    );
-    // syscall_flag = the 64-bit value actually passed to SYS_unshare (matches test_unshare.c).
-    evidence.insert("syscall_flag".into(), format!("{:#x}", flag));
     evidence.insert("before_session".into(), before_session.clone());
-    if let Some(ref c) = header_col {
-        evidence.insert("collides_with".into(), c.clone());
-    } else if let Some(ref c) = collides_with {
-        evidence.insert("collides_with".into(), c.clone());
-    }
+    evidence.insert(
+        "creation_method".into(),
+        format!("prctl(PR_SET_AGENT_NS={:#x})", PR_SET_AGENT_NS),
+    );
 
-    let unshare_errno = syscalls.unshare_newagent();
-    evidence.insert("unshare_errno".into(), unshare_errno.to_string());
+    let prctl_errno = syscalls.create_agent_ns();
+    evidence.insert("prctl_errno".into(), prctl_errno.to_string());
 
-    if unshare_errno != 0 {
-        // First layer failed: FlagAccepted ✗
-        // Report collides_with as the header collision (0x100 == CLONE_VM) since
-        // that is the root cause documented in the PRD.
+    if prctl_errno != 0 {
         let verdict = Verdict::FlagRejected {
-            flag: CLONE_NEWAGENT_HEADER,
-            collides_with: header_col.or(collides_with),
-            errno: unshare_errno,
+            flag: PR_SET_AGENT_NS as u32,
+            collides_with: None,
+            errno: prctl_errno,
         };
         return build_report("agentns", verdict, vec![], evidence);
     }
 
-    // Unshare succeeded.
+    // prctl succeeded.
     let after_session = syscalls
         .read_agent_session()
         .unwrap_or_else(|_| "error".to_string());
@@ -331,13 +250,9 @@ pub fn attest_with<S: AgentSyscalls>(syscalls: &S) -> AttestReport {
     layers_passed_session.push(Layer::SessionNonZero);
 
     // Counters
-    let counters_before = syscalls
-        .read_agent_counters()
-        .unwrap_or_default();
+    let counters_before = syscalls.read_agent_counters().unwrap_or_default();
     syscalls.do_activity();
-    let counters_after = syscalls
-        .read_agent_counters()
-        .unwrap_or_default();
+    let counters_after = syscalls.read_agent_counters().unwrap_or_default();
 
     evidence.insert(
         "counters_before".into(),
@@ -371,10 +286,7 @@ pub fn attest_with<S: AgentSyscalls>(syscalls: &S) -> AttestReport {
     let intent_tag_ok = tag_result
         .map(|v| v == 0xdeadbeef_cafebabe)
         .unwrap_or(false);
-    evidence.insert(
-        "intent_tag_ok".into(),
-        intent_tag_ok.to_string(),
-    );
+    evidence.insert("intent_tag_ok".into(), intent_tag_ok.to_string());
 
     if !intent_tag_ok {
         return build_report(
@@ -414,7 +326,6 @@ fn build_report(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Minimal RFC 3339 without chrono dependency.
         format_rfc3339(secs)
     };
 
@@ -429,22 +340,18 @@ fn build_report(
 }
 
 fn format_rfc3339(unix_secs: u64) -> String {
-    // Very simple UTC formatter (avoids pulling in chrono for a single field).
     let s = unix_secs;
     let days = s / 86400;
     let rem = s % 86400;
     let hh = rem / 3600;
     let mm = (rem % 3600) / 60;
     let ss = rem % 60;
-
-    // Gregorian calendar calculation
     let (y, mo, d) = days_to_ymd(days);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, hh, mm, ss)
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Days since Unix epoch (1970-01-01)
-    let mut d = days + 719468; // days since year 0 (proleptic Gregorian)
+    let mut d = days + 719468;
     let era = d / 146097;
     d %= 146097;
     let yoe = (d - d / 1460 + d / 36524 - d / 146096) / 365;
@@ -463,49 +370,31 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Run the agentns attestation by forking a child process.
 ///
-/// The child calls `unshare(CLONE_NEWAGENT)` and reports its findings back to
+/// The child calls `prctl(PR_SET_AGENT_NS)` and reports its findings back to
 /// the parent over a pipe.  The parent's own agent_session is never mutated
 /// (the namespace dies with the child).
 pub fn attest_live() -> AttestReport {
-    let flag = CLONE_NEWAGENT;
-    let collides_with = check_collision(flag);
-    let header_col = header_collision();
-
-    // Read parent's session before the fork.
     let before_session = std::fs::read_to_string("/proc/self/agent_session")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unavailable".to_string());
 
     let mut evidence = Evidence::new();
-    // compiled_flag = the uapi-header constant (0x100 == CLONE_VM collision).
     evidence.insert(
-        "compiled_flag".into(),
-        format!("{:#x}", CLONE_NEWAGENT_HEADER),
+        "creation_method".into(),
+        format!("prctl(PR_SET_AGENT_NS={:#x})", PR_SET_AGENT_NS),
     );
-    // syscall_flag = the 64-bit value actually passed to SYS_unshare.
-    evidence.insert("syscall_flag".into(), format!("{:#x}", flag));
     evidence.insert("before_session".into(), before_session.clone());
-    if let Some(ref c) = header_col {
-        evidence.insert("collides_with".into(), c.clone());
-    } else if let Some(ref c) = collides_with {
-        evidence.insert("collides_with".into(), c.clone());
-    }
 
     // Create pipe for child→parent communication.
-    let mut pipe_r: libc::c_int = 0;
-    let mut pipe_w: libc::c_int = 0;
-    let pipe_arr = [&mut pipe_r as *mut libc::c_int, &mut pipe_w as *mut libc::c_int];
-    let pipe_fds: [libc::c_int; 2] = [0; 2];
-    // Safety: pipe2 is safe to call.
-    let rc = unsafe {
+    let rc;
+    let pipe_r: libc::c_int;
+    let pipe_w: libc::c_int;
+    unsafe {
         let mut fds = [0i32; 2];
-        let r = libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC);
+        rc = libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC);
         pipe_r = fds[0];
         pipe_w = fds[1];
-        r
-    };
-    let _ = pipe_arr; // suppress unused warning
-    let _ = pipe_fds;
+    }
 
     if rc != 0 {
         evidence.insert(
@@ -525,7 +414,6 @@ pub fn attest_live() -> AttestReport {
     let child_pid = unsafe { libc::fork() };
     match child_pid {
         -1 => {
-            // Fork failed.
             unsafe { libc::close(pipe_r) };
             unsafe { libc::close(pipe_w) };
             evidence.insert(
@@ -545,10 +433,9 @@ pub fn attest_live() -> AttestReport {
             // Child process.
             unsafe { libc::close(pipe_r) };
 
-            // Use syscall() directly to pass the full 64-bit flag — same as test_unshare.c.
-            let unshare_ret =
-                unsafe { libc::syscall(libc::SYS_unshare, CLONE_NEWAGENT as libc::c_long) };
-            let unshare_errno = if unshare_ret == 0 {
+            // Create a fresh agent namespace via prctl(PR_SET_AGENT_NS).
+            let prctl_ret = unsafe { libc::prctl(PR_SET_AGENT_NS, 0, 0, 0, 0) };
+            let prctl_errno = if prctl_ret == 0 {
                 0i32
             } else {
                 std::io::Error::last_os_error()
@@ -556,7 +443,7 @@ pub fn attest_live() -> AttestReport {
                     .unwrap_or(-1)
             };
 
-            let after_session = if unshare_errno == 0 {
+            let after_session = if prctl_errno == 0 {
                 std::fs::read_to_string("/proc/self/agent_session")
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|_| "error".to_string())
@@ -566,23 +453,29 @@ pub fn attest_live() -> AttestReport {
 
             let counters_before = read_counters_raw();
 
-            // Do some activity to advance counters.
             for _ in 0..8 {
                 let _ = std::fs::OpenOptions::new().read(true).open("/dev/null");
             }
 
             let counters_after = read_counters_raw();
 
-            let intent_tag_ok = if unshare_errno == 0 {
-                const PR_SET: libc::c_int = 60;
-                const PR_GET: libc::c_int = 61;
-                let set_ret =
-                    unsafe { libc::prctl(PR_SET, 0xdeadbeef_cafebabeu64 as libc::c_ulong, 0, 0, 0) };
+            let intent_tag_ok = if prctl_errno == 0 {
+                // Kernel uses copy_from_user/copy_to_user — pass a pointer.
+                let mut tag_val: u64 = 0xdeadbeef_cafebabe;
+                let set_ret = unsafe {
+                    libc::prctl(
+                        PR_SET_AGENT_INTENT_TAG,
+                        &mut tag_val as *mut u64 as libc::c_ulong,
+                        0,
+                        0,
+                        0,
+                    )
+                };
                 if set_ret == 0 {
                     let mut out: u64 = 0;
                     let get_ret = unsafe {
                         libc::prctl(
-                            PR_GET,
+                            PR_GET_AGENT_INTENT_TAG,
                             &mut out as *mut u64 as libc::c_ulong,
                             0,
                             0,
@@ -598,7 +491,7 @@ pub fn attest_live() -> AttestReport {
             };
 
             let report = ChildReport {
-                unshare_errno,
+                prctl_errno,
                 after_session,
                 counters_before,
                 counters_after,
@@ -606,7 +499,6 @@ pub fn attest_live() -> AttestReport {
             };
             let payload = encode_child_report(&report);
 
-            // Write to pipe.
             use std::os::unix::io::FromRawFd;
             let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_w) };
             let _ = writer.write_all(&payload);
@@ -618,18 +510,15 @@ pub fn attest_live() -> AttestReport {
             // Parent process.
             unsafe { libc::close(pipe_w) };
 
-            // Read child's report.
             use std::os::unix::io::FromRawFd;
             let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_r) };
             let mut payload = Vec::new();
             let _ = reader.read_to_end(&mut payload);
             drop(reader);
 
-            // Wait for child.
             let mut status: libc::c_int = 0;
             unsafe { libc::waitpid(child_pid, &mut status, 0) };
 
-            // Verify parent session is unchanged (AC7).
             let parent_session_after = std::fs::read_to_string("/proc/self/agent_session")
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| "unavailable".to_string());
@@ -650,10 +539,7 @@ pub fn attest_live() -> AttestReport {
                 );
             };
 
-            evidence.insert(
-                "unshare_errno".into(),
-                child.unshare_errno.to_string(),
-            );
+            evidence.insert("prctl_errno".into(), child.prctl_errno.to_string());
             evidence.insert("after_session".into(), child.after_session.clone());
             evidence.insert(
                 "counters_before".into(),
@@ -671,13 +557,13 @@ pub fn attest_live() -> AttestReport {
             );
             evidence.insert("intent_tag_ok".into(), child.intent_tag_ok.to_string());
 
-            if child.unshare_errno != 0 {
+            if child.prctl_errno != 0 {
                 return build_report(
                     "agentns",
                     Verdict::FlagRejected {
-                        flag: CLONE_NEWAGENT_HEADER,
-                        collides_with: header_col.or(collides_with),
-                        errno: child.unshare_errno,
+                        flag: PR_SET_AGENT_NS as u32,
+                        collides_with: None,
+                        errno: child.prctl_errno,
                     },
                     vec![],
                     evidence,
@@ -727,15 +613,28 @@ fn read_counters_raw() -> AgentCounters {
         Ok(s) => s,
         Err(_) => return AgentCounters::default(),
     };
+    parse_agent_counters(&raw)
+}
+
+/// Parse /proc/self/agent_counters JSON.
+///
+/// The kernel emits: total_syscalls, openat_count, write_bytes,
+/// connect_count, unlink_count, fork_count, elapsed_ns.
+/// `total_syscalls` is a separate bucket that may not count openat/write;
+/// use `openat_count` as the primary "did any work?" signal since
+/// the test opens /dev/null 8 times.
+fn parse_agent_counters(raw: &str) -> AgentCounters {
     let mut c = AgentCounters::default();
     for line in raw.lines() {
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() == 2 {
-            let key = parts[0].trim();
-            let val: u64 = parts[1].trim().parse().unwrap_or(0);
+        let line = line.trim().trim_end_matches(',');
+        if let Some((key_part, val_part)) = line.split_once(':') {
+            let key = key_part.trim().trim_matches('"');
+            let val: u64 = val_part.trim().parse().unwrap_or(0);
             match key {
-                "syscalls" => c.syscalls = val,
-                "bytes_written" => c.bytes_written = val,
+                // openat_count advances when we open files — use as "syscalls" proxy.
+                "openat_count" => c.syscalls = c.syscalls.saturating_add(val),
+                "total_syscalls" => c.syscalls = c.syscalls.saturating_add(val),
+                "write_bytes" => c.bytes_written = val,
                 _ => {}
             }
         }
@@ -751,9 +650,8 @@ fn read_counters_raw() -> AgentCounters {
 mod tests {
     use super::*;
 
-    /// Fake syscalls builder for tests.
     struct FakeSyscalls {
-        unshare_errno: i32,
+        prctl_errno: i32,
         session_before: String,
         session_after: String,
         counters_before: AgentCounters,
@@ -764,7 +662,7 @@ mod tests {
     impl FakeSyscalls {
         fn rejected(errno: i32) -> Self {
             FakeSyscalls {
-                unshare_errno: errno,
+                prctl_errno: errno,
                 session_before: "0".repeat(32),
                 session_after: String::new(),
                 counters_before: AgentCounters::default(),
@@ -775,7 +673,7 @@ mod tests {
 
         fn live_full() -> Self {
             FakeSyscalls {
-                unshare_errno: 0,
+                prctl_errno: 0,
                 session_before: "0".repeat(32),
                 session_after: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4".to_string(),
                 counters_before: AgentCounters {
@@ -792,7 +690,7 @@ mod tests {
 
         fn ns_created_session_zero() -> Self {
             FakeSyscalls {
-                unshare_errno: 0,
+                prctl_errno: 0,
                 session_before: "0".repeat(32),
                 session_after: "0".repeat(32),
                 counters_before: AgentCounters::default(),
@@ -802,37 +700,7 @@ mod tests {
         }
     }
 
-    impl AgentSyscalls for FakeSyscalls {
-        fn read_agent_session(&self) -> std::io::Result<String> {
-            // Return before_session first call, after_session second.
-            // We use a simple heuristic: if this is called after unshare succeeded.
-            Ok(self.session_before.clone())
-        }
-        fn unshare_newagent(&self) -> i32 {
-            self.unshare_errno
-        }
-        fn read_agent_counters(&self) -> std::io::Result<AgentCounters> {
-            Ok(self.counters_before.clone())
-        }
-        fn intent_tag_roundtrip(&self, _tag: u64) -> std::io::Result<u64> {
-            if self.intent_tag_ok {
-                Ok(0xdeadbeef_cafebabe)
-            } else {
-                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
-            }
-        }
-    }
-
     /// Stateful fake that returns different values for before/after reads.
-    ///
-    /// Call order in `attest_with`:
-    ///   1. read_agent_session  → session_before
-    ///   2. unshare_newagent
-    ///   3. read_agent_session  → session_after
-    ///   4. read_agent_counters → counters_before
-    ///   5. do_activity
-    ///   6. read_agent_counters → counters_after
-    ///   7. intent_tag_roundtrip
     struct StatefulFake {
         session_call: std::cell::Cell<u32>,
         counters_call: std::cell::Cell<u32>,
@@ -849,6 +717,25 @@ mod tests {
         }
     }
 
+    impl AgentSyscalls for FakeSyscalls {
+        fn read_agent_session(&self) -> std::io::Result<String> {
+            Ok(self.session_before.clone())
+        }
+        fn create_agent_ns(&self) -> i32 {
+            self.prctl_errno
+        }
+        fn read_agent_counters(&self) -> std::io::Result<AgentCounters> {
+            Ok(self.counters_before.clone())
+        }
+        fn intent_tag_roundtrip(&self, _tag: u64) -> std::io::Result<u64> {
+            if self.intent_tag_ok {
+                Ok(0xdeadbeef_cafebabe)
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+        }
+    }
+
     impl AgentSyscalls for StatefulFake {
         fn read_agent_session(&self) -> std::io::Result<String> {
             let n = self.session_call.get();
@@ -859,8 +746,8 @@ mod tests {
                 Ok(self.inner.session_after.clone())
             }
         }
-        fn unshare_newagent(&self) -> i32 {
-            self.inner.unshare_newagent()
+        fn create_agent_ns(&self) -> i32 {
+            self.inner.prctl_errno
         }
         fn read_agent_counters(&self) -> std::io::Result<AgentCounters> {
             let n = self.counters_call.get();
@@ -877,8 +764,6 @@ mod tests {
         fn do_activity(&self) {}
     }
 
-    /// AC5: A fake with successful unshare, non-zero session, advancing counters,
-    /// and working intent tag should produce `Live` with all five layers.
     #[test]
     fn test_live_all_layers() {
         let fake = StatefulFake::new(FakeSyscalls::live_full());
@@ -901,8 +786,6 @@ mod tests {
         assert!(report.layers_passed.contains(&Layer::IntentTagRoundtrip));
     }
 
-    /// AC6: A fake where unshare succeeds but session stays zero should produce
-    /// `NsCreatedButSessionZero`.
     #[test]
     fn test_ns_created_session_zero() {
         let fake = FakeSyscalls::ns_created_session_zero();
@@ -915,28 +798,19 @@ mod tests {
         );
     }
 
-    /// Verify FlagRejected with errno 22 (EINVAL) produces the right verdict.
     #[test]
-    fn test_flag_rejected_einval() {
-        let fake = FakeSyscalls::rejected(libc::EINVAL);
+    fn test_prctl_rejected_eperm() {
+        let fake = FakeSyscalls::rejected(libc::EPERM);
         let report = attest_with(&fake);
         match &report.verdict {
             Verdict::FlagRejected { errno, .. } => {
-                assert_eq!(*errno, libc::EINVAL);
+                assert_eq!(*errno, libc::EPERM);
             }
             other => panic!("expected FlagRejected, got {:?}", other),
         }
         assert_eq!(report.layers_passed.len(), 0);
     }
 
-    /// Verify the collision table correctly identifies CLONE_VM for 0x100.
-    #[test]
-    fn test_collision_clone_vm() {
-        let c = check_collision(0x100);
-        assert_eq!(c.as_deref(), Some("CLONE_VM"));
-    }
-
-    /// Verify exit codes.
     #[test]
     fn test_exit_codes() {
         assert_eq!(
@@ -958,5 +832,13 @@ mod tests {
         assert_eq!(Verdict::NsCreatedButSessionZero.exit_code(), 2);
         assert_eq!(Verdict::CountersDead.exit_code(), 3);
         assert_eq!(Verdict::IntentTagLost.exit_code(), 4);
+    }
+
+    #[test]
+    fn test_pr_set_agent_ns_value() {
+        // Verify the prctl constant matches the kernel header definition.
+        // PR_AGENT_BASE = 0x41544E53 ("ATNS"), PR_SET_AGENT_NS = base + 7.
+        assert_eq!(PR_AGENT_BASE as u32, 0x41544E53u32);
+        assert_eq!(PR_SET_AGENT_NS as u32, 0x41544E5Au32);
     }
 }

@@ -16,5 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 assay-core = { path = "assay-core" }
+libc = "0.2"
 serde_json = "1"
 sigpipe = "0.1"

@@ -4,7 +4,7 @@
 //!   assay agentns           # human-readable report
 //!   assay agentns --json    # JSON AttestReport
 
-use assay_core::agentns::attest_live;
+use assay_core::agentns::{attest_live, PR_SET_AGENT_NS};
 use assay_core::types::{Layer, Verdict};
 
 fn main() {
@@ -50,15 +50,18 @@ fn cmd_agentns(json_mode: bool) {
                 collides_with,
                 errno,
             } => {
-                println!("VERDICT: FlagRejected");
-                println!(
-                    "  compiled_flag = {:#010x}",
-                    flag
-                );
+                println!("VERDICT: PrctlRejected");
+                println!("  prctl_op      = {:#010x} (PR_SET_AGENT_NS)", flag);
                 if let Some(c) = collides_with {
-                    println!("  collides_with = {}", c);
+                    println!("  note          = {}", c);
                 }
-                println!("  unshare errno  = {} (EINVAL=22)", errno);
+                let errno_name = match *errno {
+                    libc::EPERM => "EPERM — needs CAP_SYS_ADMIN (run as root)",
+                    libc::EINVAL => "EINVAL — kernel does not know PR_SET_AGENT_NS (wrong kernel?)",
+                    libc::ENOSYS => "ENOSYS — agentns not compiled in",
+                    _ => "unknown errno",
+                };
+                println!("  errno         = {} ({})", errno, errno_name);
             }
             Verdict::NsCreatedButSessionZero => {
                 println!("VERDICT: NsCreatedButSessionZero");
@@ -124,8 +127,10 @@ fn first_failed_layer(verdict: &Verdict) -> Option<Layer> {
     }
 }
 
-// Compile-time assertion: CLONE_NEWAGENT_HEADER must equal 0x100 (CLONE_VM collision).
-use assay_core::agentns::CLONE_NEWAGENT_HEADER;
+// Compile-time assertion: PR_SET_AGENT_NS must equal PR_AGENT_BASE + 7 = 0x41544E5A.
 const _: () = {
-    assert!(CLONE_NEWAGENT_HEADER == 0x100, "CLONE_NEWAGENT_HEADER constant mismatch");
+    assert!(
+        PR_SET_AGENT_NS as u32 == 0x41544E5Au32,
+        "PR_SET_AGENT_NS constant mismatch"
+    );
 };

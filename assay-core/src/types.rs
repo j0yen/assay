@@ -77,7 +77,7 @@ impl Verdict {
     pub fn remediation(&self) -> &'static str {
         match self {
             Verdict::FlagRejected { .. } => {
-                "kernel rejects the flag — see PRD-agentns-clone-flag-fix; wrapping the launch will not help"
+                "prctl(PR_SET_AGENT_NS) rejected — ensure linux-wintermute kernel is booted and caller has CAP_SYS_ADMIN (try: sudo assay agentns)"
             }
             Verdict::NsCreatedButSessionZero => {
                 "flag accepted but session stays zero — kernel session-id assignment is broken; check agentns patch 0006"
